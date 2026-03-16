@@ -306,9 +306,15 @@ class Engine:
         df=self.df.copy(); df["date"]=df.index.date; df["hour"]=df.index.hour
         dates=sorted(df["date"].unique()); days=[]; prev_dir=None; recent=[]; prev_pb=0; prev_run=0
         for i,date in enumerate(dates):
+            # Skip weekends — no valid CBDR on Sat/Sun
+            dow=pd.Timestamp(date).dayofweek  # 0=Mon, 5=Sat, 6=Sun
+            if dow >= 5: continue
             dd=df[df["date"]==date]
             if len(dd)<4: continue
-            pd2=dates[i-1] if i>0 else None
+            # Find previous WEEKDAY for cross-midnight CBDR
+            pd2=None
+            for pi in range(i-1,-1,-1):
+                if pd.Timestamp(dates[pi]).dayofweek < 5: pd2=dates[pi]; break
             if self.cs>self.ce:
                 late=df[df["date"]==pd2].query("hour>=@self.cs") if pd2 else pd.DataFrame()
                 early=dd.query("hour<@self.ce") if self.ce>0 else pd.DataFrame()
@@ -351,8 +357,11 @@ class Engine:
                 wb = "neutral"; mbi = "neutral"
                 pct_5d = 0; pct_20d = 0
             # Session = trading window after CBDR. May wrap around midnight.
-            ni=i+1
-            next_day=df[df["date"]==dates[ni]] if ni<len(dates) else pd.DataFrame()
+            # Find next WEEKDAY for cross-midnight data
+            next_day=pd.DataFrame()
+            for ndi in range(i+1, min(i+4, len(dates))):
+                if pd.Timestamp(dates[ndi]).dayofweek < 5:
+                    next_day=df[df["date"]==dates[ndi]]; break
             if self.ss < self.se:
                 # Normal range: e.g. session 0:00-20:00
                 sess=dd.query("hour>=@self.ss and hour<@self.se")
@@ -423,8 +432,14 @@ class Engine:
         df["date"]=df.index.date; df["hour"]=df.index.hour; dates=sorted(df["date"].unique())
         if len(dates)<3: return None
         cbdr=pd.DataFrame(); d=None
-        for d in reversed(dates[-5:]):
-            dd=df[df["date"]==d]; pi=dates.index(d)-1; pd2=dates[pi] if pi>=0 else None
+        # Search recent dates, skip weekends
+        for d in reversed(dates[-10:]):
+            if pd.Timestamp(d).dayofweek >= 5: continue  # skip Sat/Sun
+            dd=df[df["date"]==d]
+            # Find previous weekday for cross-midnight CBDR
+            pd2=None; di=dates.index(d) if d in dates else -1
+            for pi in range(di-1,-1,-1):
+                if pd.Timestamp(dates[pi]).dayofweek < 5: pd2=dates[pi]; break
             if self.cs>self.ce:
                 late=df[df["date"]==pd2].query("hour>=@self.cs") if pd2 else pd.DataFrame()
                 early=dd.query("hour<@self.ce") if self.ce>0 else pd.DataFrame()
@@ -460,15 +475,16 @@ class Engine:
         elif self.ss == self.se:
             sess=dd2
         else:
-            # Wraps midnight: get late today + early next day
+            # Wraps midnight: get late today + early next weekday
             sess_today=dd2.query("hour>=@self.ss")
-            # Find next day
-            all_dates=sorted(df["date"].unique()); di=list(all_dates).index(d) if d in all_dates else -1
-            if di>=0 and di+1<len(all_dates):
-                nd=df[df["date"]==all_dates[di+1]].query("hour<@self.se")
-                sess=pd.concat([sess_today, nd])
-            else:
-                sess=sess_today
+            all_dates=sorted(df["date"].unique())
+            di=all_dates.index(d) if d in all_dates else -1
+            nd_data=pd.DataFrame()
+            for ndi in range(di+1, min(di+4, len(all_dates))):
+                if pd.Timestamp(all_dates[ndi]).dayofweek < 5:
+                    nd_data=df[df["date"]==all_dates[ndi]].query("hour<@self.se")
+                    break
+            sess=pd.concat([sess_today, nd_data]) if len(nd_data)>0 else sess_today
         bdir=None
         for j in range(len(sess)):
             c2=sess.iloc[j]
@@ -978,21 +994,22 @@ if run_btn or "tdf" in st.session_state:
             sig_date = pd.Timestamp(det["date"])
             today = pd.Timestamp(datetime.now().date())
             days_ago = (today - sig_date).days
-            if days_ago == 0:
-                date_msg = f"**{det.get('window','')}** | **{det['day']}** | Price: **{det.get('price','N/A')}**"
-            elif days_ago == 1:
-                date_msg = f"**{det.get('window','')}** | **{det['day']}** (yesterday) | Price: **{det.get('price','N/A')}**"
-            else:
-                date_msg = f"**{det.get('window','')}** | **{det['day']}** ({days_ago} days ago) | Price: **{det.get('price','N/A')}**"
-            st.markdown(date_msg)
+            cbdr_from = det.get("cbdr_from","?")
+            cbdr_to = det.get("cbdr_to","?")
+            rm_label = "closes" if det.get("range_mode")=="close" else "wicks"
+            n_candles = det.get("cbdr_candles","?")
+
+            # Main header: trading day + CBDR source info
+            st.markdown(f"**Trade day: {det['day']} {det['date']}** | Price: **{det.get('price','N/A')}**")
+            st.markdown(f"CBDR data: **{cbdr_from} to {cbdr_to} UTC** ({n_candles} candles, {rm_label})")
+
             if days_ago > 0:
-                st.info(f"Showing {det['day']} {det['date']} signal — the most recent completed CBDR. "
-                        f"Today's CBDR window ({cbdr_start_gmt:02d}:00-{cbdr_end_gmt:02d}:00 UTC) "
-                        f"{'has not formed yet.' if days_ago <= 3 else 'was during the weekend (markets closed).'} "
-                        f"Run again after {cbdr_end_gmt:02d}:00 UTC tonight for today's signal.")
+                if days_ago <= 3:
+                    st.info(f"This is {det['day']}'s signal ({days_ago} day{'s' if days_ago>1 else ''} ago). "
+                            f"Today's CBDR ({cbdr_start_gmt:02d}:00-{cbdr_end_gmt:02d}:00 UTC) hasn't formed yet. "
+                            f"Run again after {cbdr_end_gmt:02d}:00 UTC tonight.")
             dc=st.columns(6)
-            rm_label="closes" if det.get("range_mode")=="close" else "wicks"
-            dc[0].markdown(f'<div class="det"><div class="lbl">Range ({rm_label})</div><div class="vl">{det["rh"]} - {det["rl"]}</div><div class="sub">{det["rs"]} pts | {det.get("cbdr_candles","?")} candles</div></div>',unsafe_allow_html=True)
+            dc[0].markdown(f'<div class="det"><div class="lbl">Range ({rm_label})</div><div class="vl">{det["rh"]} - {det["rl"]}</div><div class="sub">{det["rs"]} pts | {n_candles} candles</div></div>',unsafe_allow_html=True)
             dc[1].markdown(f'<div class="det"><div class="lbl">1st</div><div class="vl">{"G" if det["fc_green"] else "R"} {det["fc_pat"]}</div></div>',unsafe_allow_html=True)
             dc[2].markdown(f'<div class="det"><div class="lbl">Last</div><div class="vl">{"G" if det["lc_green"] else "R"} {det["lc_pat"]}</div></div>',unsafe_allow_html=True)
             dc[3].markdown(f'<div class="det"><div class="lbl">Trend</div><div class="vl">{det["cbdr_trend"]:+.2f}</div><div class="sub">5d:{det["wbias"]} ({det.get("pct_5d",0):+.1f}%) 20d:{det["mbias"]} ({det.get("pct_20d",0):+.1f}%)</div></div>',unsafe_allow_html=True)
